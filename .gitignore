@@ -1,0 +1,7 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+
+# Sensitive configuration files
+configs/openai_config.yaml
+configs/s3_config.yaml 
