@@ -34,7 +34,7 @@ class GPTsNode:
                 "image": ("IMAGE",),
             },
             "optional": {
-                "custom_instructions": ("STRING", {"default": "你是一个专业的图像分析助手", "multiline": True}),
+                # "custom_instructions": ("STRING", {"default": "你是一个专业的图像分析助手", "multiline": True}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.1}),
             }
         }
@@ -189,146 +189,187 @@ class GPTsNode:
         except Exception as e:
             print(f"[S3 Cleanup Error] 意外错误: {str(e)}")
 
-    def call_gpts(self, openai_config, s3_config, prompt, image, custom_instructions="", temperature=0.7):
-        file_info = None  # 用于存储上传文件信息
+    def call_gpts(
+        self,
+        openai_config: dict,
+        s3_config: dict,
+        image,                       # torch.Tensor (C,H,W) or (1,C,H,W)
+        prompt: str = "",            # 保留，但当前不使用
+        custom_instructions: str = "", # This will be passed from INPUT_TYPES if connected
+        temperature: float = 0.7,
+    ):
+        file_info = None
         try:
-            print(f"[Debug] openai_config类型: {type(openai_config)}, 内容: {openai_config}")
-            print(f"[Debug] s3_config类型: {type(s3_config)}, 内容: {s3_config}")
-            # 添加配置验证
-            if not openai_config.get('api_key'):
-                raise ValueError("OpenAI API密钥不能为空")
-            if not openai_config.get('assistant_id'):
-                raise ValueError("助手ID不能为空")
-            if not s3_config.get('bucket_name'):
-                raise ValueError("S3存储桶名称不能为空")
-            
-            # 转换图像为字节流
-            tensor = image.cpu()
-            pil_image = Image.fromarray(tensor.mul(255).clamp(0, 255).byte().numpy()[0])
-            img_byte_arr = io.BytesIO()
-            pil_image.save(img_byte_arr, format='PNG')
-            img_byte_arr = img_byte_arr.getvalue()
-            
-            # 上传到S3（修改返回值处理）
-            file_info = self.upload_to_s3(img_byte_arr, s3_config)
-            if not file_info or not file_info.get('url'):
-                return ("Error: S3上传失败",)
-            
-            # 创建OpenAI客户端时添加版本配置
-            client = OpenAI(
-                api_key=openai_config['api_key'],
-                default_headers={"OpenAI-Beta": "assistants=v2"}  # 显式指定API版本
-            )
-            
-            # 检查SDK版本
-            print(f"[OpenAI] SDK版本: {openai.__version__}")  # 添加版本信息输出
-            
-            # 创建或获取现有助手时添加版本参数
-            assistant = client.beta.assistants.retrieve(
-                assistant_id=openai_config['assistant_id'],
-                timeout=30  # 增加超时时间
-            )
-            
-            # 构建消息内容
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": file_info['url']}  # 使用S3 URL
-                    }
-                ]
-            }]
+            # ---- 基础配置检查 ---------------------------------------------------
+            if not openai_config.get("api_key"):
+                return ("Error: OpenAI API key is missing.",)
+            if not openai_config.get("assistant_id"):
+                return ("Error: Assistant ID is missing.",)
+            if not s3_config.get("bucket_name"):
+                return ("Error: S3 bucket name is missing.",)
 
-            # 创建Thread并运行
-            thread = client.beta.threads.create(messages=messages)
+            # ---- 图片转字节流并上传 S3 ------------------------------------------
+            tensor = image.cpu()
+            print(f"[Debug] Original tensor shape: {tensor.shape}")
+            
+            # Handle different tensor formats from ComfyUI
+            if tensor.dim() == 4:  # (batch, height, width, channels) or (batch, channels, height, width)
+                tensor = tensor[0]  # Remove batch dimension
+            elif tensor.dim() == 3:
+                pass  # Keep as is, might be (height, width, channels) or (channels, height, width)
+            elif tensor.dim() == 2:
+                # Might be grayscale (height, width), add channel dimension
+                tensor = tensor.unsqueeze(-1)
+            else:
+                return (f"Error: Unsupported tensor dimensions: {tensor.shape}",)
+            
+            print(f"[Debug] After batch removal tensor shape: {tensor.shape}")
+            
+            # Ensure we have a valid image tensor shape
+            if len(tensor.shape) != 3:
+                return (f"Error: Expected 3D tensor after processing, got shape: {tensor.shape}",)
+            
+            # Check if this looks like a valid image tensor
+            h, w, c = tensor.shape
+            if c > w or c > h:  # Likely (channels, height, width) format
+                if tensor.shape[0] in [1, 3, 4]:  # Common channel counts
+                    tensor = tensor.permute(1, 2, 0)  # CHW -> HWC
+                    print(f"[Debug] Permuted CHW to HWC: {tensor.shape}")
+                else:
+                    return (f"Error: Tensor shape {tensor.shape} doesn't appear to be a valid image format",)
+            
+            # Ensure tensor values are in valid range and convert to uint8
+            tensor = tensor.clamp(0, 1)  # Clamp to [0, 1] first
+            tensor = (tensor * 255).byte()  # Convert to [0, 255] uint8
+            
+            # Convert to numpy array
+            numpy_array = tensor.numpy()
+            print(f"[Debug] Final numpy array shape for PIL: {numpy_array.shape}")
+            
+            # Handle grayscale vs RGB
+            if numpy_array.shape[2] == 1:
+                numpy_array = numpy_array.squeeze(-1)  # Remove single channel dimension for grayscale
+                pil_image = Image.fromarray(numpy_array, mode='L')
+            elif numpy_array.shape[2] == 3:
+                pil_image = Image.fromarray(numpy_array, mode='RGB')
+            elif numpy_array.shape[2] == 4:
+                pil_image = Image.fromarray(numpy_array, mode='RGBA')
+            else:
+                return (f"Error: Unsupported number of channels: {numpy_array.shape[2]}",)
+            
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            file_info = self.upload_to_s3(buf.getvalue(), s3_config)
+            if not file_info or not file_info.get("url"):
+                return ("Error: S3 upload failed.",)
+
+            # ---- OpenAI 客户端、助手 -------------------------------------------
+            client = OpenAI(
+                api_key=openai_config["api_key"],
+                default_headers={"OpenAI-Beta": "assistants=v2"},
+            )
+            print(f"[OpenAI] SDK 版本: {openai.__version__}")
+
+            # 只检索，不创建
+            assistant = client.beta.assistants.retrieve(
+                assistant_id=openai_config["assistant_id"], timeout=30
+            )
+
+            # ---- 构造消息：仅 image_url -----------------------------------------
+            messages_payload = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": file_info["url"],  # 预签名 / 公开 URL
+                                "detail": "auto",
+                            },
+                        }
+                    ],
+                }
+            ]
+
+            # ---- 创建线程并运行 --------------------------------------------------
+            thread = client.beta.threads.create(messages=messages_payload)
             run = client.beta.threads.runs.create(
                 thread_id=thread.id,
-                assistant_id=assistant.id,
-                instructions=custom_instructions,
-                temperature=temperature
-            )
-            
-            # 添加超时和状态检查
-            max_retries = 30  # 30次尝试
-            wait_seconds = 5  # 每次等待5秒
-            current_attempt = 0
-            
-            print(f"[OpenAI] 开始监控运行状态 (ID: {run.id})")
-            
-            while current_attempt < max_retries:
-                run = client.beta.threads.runs.retrieve(
-                    thread_id=thread.id,
-                    run_id=run.id
-                )
-                
-                print(f"[OpenAI] 运行状态检查 #{current_attempt+1}: {run.status}")
-                
-                if run.status == "completed":
-                    break
-                elif run.status in ["failed", "cancelled", "expired"]:
-                    print(f"[OpenAI] 运行异常终止，状态: {run.status}")
-                    if run.last_error:
-                        print(f"错误详情: {run.last_error.code} - {run.last_error.message}")
-                    return (f"Error: 运行失败 ({run.status})",)
-                
-                # 添加等待间隔避免频繁请求
-                time.sleep(wait_seconds)
-                current_attempt += 1
-            else:
-                print(f"[OpenAI] 错误: 超过最大等待时间 ({max_retries*wait_seconds}秒)")
-                return ("Error: 请求超时",)
-            
-            # 获取响应时添加排序
-            messages = client.beta.threads.messages.list(
-                thread_id=thread.id,
-                order="asc"  # 改为正序获取最新消息
+                assistant_id=assistant.id, # Corrected from openai_config[\"assistant_id\"] to assistant.id
+                temperature=temperature,
             )
 
-            # 添加更安全的响应解析
+            # ---- 轮询运行状态 ----------------------------------------------------
+            for attempt in range(30):  # 最长约 60 s
+                run = client.beta.threads.runs.retrieve(
+                    thread_id=thread.id, run_id=run.id
+                )
+                print(f"[OpenAI] 运行状态检查 #{attempt+1}: {run.status}")
+                if run.status == "completed":
+                    break
+                if run.status in {"failed", "cancelled", "expired"}:
+                    detail = (
+                        f"{run.last_error.code} - {run.last_error.message}"
+                        if run.last_error
+                        else "no detail"
+                    )
+                    return (f"Error: Run {run.status}. {detail}",)
+                time.sleep(2)
+            else:
+                return ("Error: Request timed out.",)
+
+            # ---- 获取最新助手回复（文本） - Aligned with hello_world example ----
+            msgs = client.beta.threads.messages.list(
+                thread_id=thread.id, order="desc", limit=1 # Fetch only the latest message
+            )
+            
             response_text = ""
-            if messages and hasattr(messages, 'data'):
-                for message in reversed(messages.data):
-                    # 添加空值检查
-                    if not message or not hasattr(message, 'content'):
-                        continue
-                        
-                    if message.role == "assistant":
-                        for content in message.content:
-                            # 添加内容类型检查
-                            if not content:
-                                continue
-                                
-                            if content.type == "text" and hasattr(content.text, 'value'):
-                                # 新增文本清洗逻辑
-                                clean_text = content.text.value
-                                # 替换所有代码块标记
-                                clean_text = clean_text.replace('```', '')
-                                # 去除首尾空白和多余空行
-                                clean_text = '\n'.join([line.strip() for line in clean_text.split('\n') if line.strip()])
-                                response_text += clean_text + "\n"
-                            elif content.type == "image_file":
-                                print("[OpenAI] 检测到图像文件响应")
-            
-            # 添加最终响应验证
+            if msgs.data and msgs.data[0]: # Check if data exists and has at least one message
+                # Directly access the first (and only expected) message
+                latest_message = msgs.data[0]
+                if latest_message.role == "assistant": # Double check it's from assistant
+                    response_text = next((
+                        block.text.value
+                        for block in latest_message.content
+                        if block.type == "text" and hasattr(block, 'text') and hasattr(block.text, "value")
+                    ), "")
+
             if not response_text.strip():
-                print("[OpenAI] 警告: 未收到有效文本响应")
-                return ("Error: 空响应",)
+                # If the run failed, provide that error instead of just "empty response"
+                if run.status != "completed": # Check run status if response is empty
+                    detail = (
+                        f"{run.last_error.code} - {run.last_error.message}"
+                        if run.last_error
+                        else "no detail for run status: " + run.status
+                    )
+                    return (f"Error: Run {run.status} but no text response. {detail}",)
+                return ("Error: Empty response from assistant or text content not found.",)
+
+            # 简单清洗
+            clean = "\\n".join(line.strip() for line in response_text.splitlines() if line.strip())
             
-            return (response_text.strip(),)
+            # 打印assistant的回复到终端
+            print(f"\n[Assistant Reply] =====================================")
+            print(clean)
+            print(f"===============================================\n")
             
+            return (clean,)
+
         except Exception as e:
-            print(f"[GPTs Error] 调用失败: {str(e)}")
-            return (f"Error: {str(e)}",)
+            import traceback # openai import is already global
+            traceback.print_exc()
+            # Check if it's an OpenAI APIError to potentially get more specific info
+            if isinstance(e, openai.APIError):
+                 return (f"Error: OpenAI APIError {e.status_code} - {e.message}",)
+            return (f"Error: {type(e).__name__} - {str(e)}",)
+
         finally:
-            # 仅保留finally中的删除逻辑
-            if file_info and file_info.get('bucket') and file_info.get('key'):
-                print(f"[S3 Cleanup] 开始删除文件: {file_info['key']}")
+            # ---- S3 清理 --------------------------------------------------------
+            if file_info and file_info.get("bucket") and file_info.get("key"):
                 try:
                     self.delete_from_s3(s3_config, file_info)
                 except Exception as e:
-                    print(f"[S3 Cleanup Error] 最终清理失败: {str(e)}")
+                    print(f"[S3 Cleanup Error] {str(e)}")
 
 class S3ConfigNode:
     @classmethod
@@ -416,38 +457,52 @@ class OpenAIConfigNode:
     FUNCTION = "get_config"
 
     def get_config(self, config_source, config_name, **kwargs):
-        try:
-            print(f"[Config Debug] 正在加载OpenAI配置，来源: {config_source}, 文件名: {config_name}.yaml")
-            config_path = CONFIG_DIR / f"{config_name}.yaml"
-            print(f"[Config Debug] 配置文件路径: {config_path.absolute()}")
+        config_data = {}
+        if config_source == "file":
+            config_file = CONFIG_DIR / f"{config_name}.yaml"
+            if config_file.exists():
+                with open(config_file, 'r') as f:
+                    loaded_yaml = yaml.safe_load(f)
+                    if isinstance(loaded_yaml, dict) and 'default' in loaded_yaml and isinstance(loaded_yaml['default'], dict):
+                        config_data = loaded_yaml['default']
+                    else:
+                        config_data = loaded_yaml
+            else:
+                print(f"[Config Node] 警告: 配置文件 {config_file} 未找到，将使用空配置。")
+                return (self.get_empty_config(),)
+
+        final_config = {}
+        final_config.update(config_data)
+
+        # Override with UI inputs if they are provided (non-empty)
+        if kwargs.get('api_key'):
+            final_config['api_key'] = kwargs['api_key']
+        if kwargs.get('assistant_id'):
+            final_config['assistant_id'] = kwargs['assistant_id']
+
+        # If keys are still missing, but were present in UI (even if empty), use UI's (potentially empty) value.
+        # This ensures UI's default empty strings are passed if no config file value exists.
+        if 'api_key' not in final_config and 'api_key' in kwargs:
+             final_config['api_key'] = kwargs['api_key']
+        if 'assistant_id' not in final_config and 'assistant_id' in kwargs:
+             final_config['assistant_id'] = kwargs['assistant_id']
+
+        if not final_config.get('api_key'):
+            print("[Config Node] 错误: API Key 未在配置文件或手动输入中提供。")
+            return ({"error": "API Key is required", "api_key": "", "assistant_id": final_config.get('assistant_id', "")},)
+
+        if not final_config.get('assistant_id'):
+            print("[Config Node] 错误: Assistant ID 未在配置文件或手动输入中提供。")
+            return ({"error": "Assistant ID is required", "api_key": final_config.get('api_key', ""), "assistant_id": ""},)
             
-            if not config_path.exists():
-                raise FileNotFoundError(f"配置文件不存在: {config_path}")
-            
-            with open(config_path) as f:
-                raw_content = f.read()
-                print(f"[Config Debug] 原始文件内容:\n{raw_content}")
-                configs = yaml.safe_load(raw_content)
-            
-            
-            
-            # 直接获取default配置
-            config = configs.get('default', {})
-            
-            # 打印解析后的配置结构
-            print(f"[Config Debug] 解析后的配置结构: {config}")
-            
-            # 验证必要字段
-            if not config.get('api_key'):
-                raise ValueError("OpenAI API密钥不能为空")
-            if not config.get('assistant_id'):
-                raise ValueError("助手ID不能为空")
-            
-            print(f"[OpenAI Config] 加载配置: {config}")
-            return (config,)  # 返回元组包裹的字典
-        except Exception as e:
-            print(f"[Config Error] 加载OpenAI配置失败: {str(e)}")
-            return ({'api_key': '', 'assistant_id': ''},)  # 返回空配置元组
+        print(f"[Config Node] OpenAI配置加载成功: api_key={'*' * (len(final_config.get('api_key', '')) - 3) + final_config.get('api_key', '')[-3:] if final_config.get('api_key') else '未设置'}, assistant_id={final_config.get('assistant_id')}")
+        return (final_config,)
+
+    def get_empty_config(self):
+        return {
+            "api_key": "",
+            "assistant_id": ""
+        }
 
 NODE_CLASS_MAPPINGS = {
     "GPTsNode": GPTsNode,
